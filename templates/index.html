@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SAFESIGHT</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn" id="menu-btn" aria-label="Thu gọn menu">&#9776;</button>
+    <div class="brand">SAFESIGHT</div>
+    <div class="top-right">
+      <span id="operator"></span>
+      <span class="conn" id="conn"></span>
+      <span id="clock"></span>
+    </div>
+  </header>
+  <nav class="sidebar" id="sidebar" aria-label="Menu chính"></nav>
+  <main id="main"></main>
+  <dialog id="dlg"></dialog>
+  <div class="toast" id="toast" role="status"></div>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

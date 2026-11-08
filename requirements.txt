@@ -1,0 +1,6 @@
+flask>=3.0
+opencv-python>=4.9
+requests>=2.31
+torch>=2.0
+mss>=10.0
+ultralytics>=8.3

@@ -1,0 +1,30 @@
+@startuml
+title Luồng hoạt động chính của SAFESIGHT
+
+start
+:Khởi động hệ thống;
+:Nạp cấu hình, cơ sở dữ liệu và model YOLO;
+:Chạy web server và kết nối nguồn video;
+
+while (Hệ thống đang hoạt động?) is (Có)
+  :Nhận khung hình từ camera hoặc video;
+  :YOLO phân tích khung hình;
+
+  if (Phát hiện hung khí?) then (Có)
+    :Tạo cảnh báo và lưu ảnh;
+    :Nhân viên kiểm tra cảnh báo;
+
+    if (Cảnh báo xác thực?) then (Có)
+      :Dispatch và cập nhật lịch sử;
+      if (Telegram được bật?) then (Có)
+        :Gửi thông báo Telegram;
+      endif
+    else (Không)
+      :Đánh dấu cảnh báo giả;
+    endif
+  endif
+endwhile (Không)
+
+:Dừng hệ thống;
+stop
+@enduml
