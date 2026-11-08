@@ -197,6 +197,17 @@ def main():
         window_name = "SAFESIGHT - Screen Detection"
         interval = 1.0 / args.fps
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        screen_area = monitor["width"] * monitor["height"]
+        preview_scale = min(
+            math.sqrt(screen_area / (2 * region["width"] * region["height"])),
+            monitor["width"] / region["width"],
+            monitor["height"] / region["height"],
+        )
+        cv2.resizeWindow(
+            window_name,
+            max(1, round(region["width"] * preview_scale)),
+            max(1, round(region["height"] * preview_scale)),
+        )
         screen_capture = LatestScreenCapture(region)
         screen_capture.start()
         tracker = DetectionTracker()
