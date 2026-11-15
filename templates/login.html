@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>
+      {{ 'Tài khoản nhân viên' if manage else 'Đăng nhập' }} · SAFESIGHT
+    </title>
+    <link
+      rel="stylesheet"
+      href="{{ url_for('static',filename='css/style.css') }}"
+    />
+  </head>
+  <body class="auth-page">
+    <main class="auth-card">
+      <div class="auth-brand">SAFESIGHT <span>HỆ THỐNG GIÁM SÁT</span></div>
+      <h1>
+        {{ 'Tài khoản nhân viên' if manage else 'Thiết lập tài khoản quản trị'
+        if first else 'Đăng nhập ca trực' }}
+      </h1>
+      <p class="hint">
+        {{ 'Tạo tài khoản riêng cho từng nhân viên để ghi nhận đúng người xử lý
+        cảnh báo.' if manage else 'Tạo tài khoản quản trị đầu tiên để bắt đầu sử
+        dụng hệ thống.' if first else 'Sử dụng tài khoản của bạn để nhận ca và
+        xử lý cảnh báo.' }}
+      </p>
+      {% if error %}
+      <p class="auth-error" role="alert">{{ error }}</p>
+      {% endif %}
+      <form method="post" class="auth-form">
+        <input type="hidden" name="csrf" value="{{ csrf_token() }}" />
+        {% if first or manage %}<label
+          >Tên nhân viên<input
+            name="display_name"
+            autocomplete="name"
+            maxlength="100"
+            required /></label
+        >{% endif %}
+        <label
+          >Tài khoản<input
+            name="username"
+            autocomplete="username"
+            maxlength="64"
+            required
+            autofocus
+        /></label>
+        <label
+          >Mật khẩu<input
+            name="password"
+            type="password"
+            autocomplete="{{ 'new-password' if first or manage else 'current-password' }}"
+            {%
+            if
+            first
+            or
+            manage
+            %}minlength="8"
+            {%
+            endif
+            %}
+            maxlength="256"
+            required
+        /></label>
+        <button class="btn primary" type="submit">
+          {{ 'Tạo tài khoản' if first or manage else 'Đăng nhập và nhận ca' }}
+        </button>
+      </form>
+      {% if manage %}
+      <div class="staff-list">
+        <h3>Nhân viên hiện có</h3>
+        {% for user in staff %}
+        <div>
+          <strong>{{ user.display_name }}</strong
+          ><span
+            >{{ user.username }} · {{ 'Quản trị viên' if user.is_admin else
+            'Nhân viên' }}</span
+          >
+        </div>
+        {% endfor %}
+      </div>
+      <a href="/">← Quay lại giám sát</a>{% endif %}
+    </main>
+  </body>
+</html>

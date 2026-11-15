@@ -1,10 +1,9 @@
-
 import json
 import math
 import sqlite3
 import threading
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from datetime import datetime, timedelta
 
 from weapon_detection import config
@@ -47,6 +46,9 @@ def init():
         CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT, level TEXT, subject TEXT, info TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL, password_hash TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS user_preferences(user_id INTEGER PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS mobile_devices(id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL, chat_id TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1);
@@ -57,6 +59,15 @@ def init():
         alert_columns = {row["name"] for row in c.execute("PRAGMA table_info(alerts)")}
         if "detections" not in alert_columns:
             c.execute("ALTER TABLE alerts ADD COLUMN detections TEXT NOT NULL DEFAULT '[]'")
+        for column in ("notification_status", "notification_info"):
+            if column not in alert_columns:
+                c.execute(f"ALTER TABLE alerts ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        for column in ("review_reason", "actual_label", "review_note"):
+            if column not in alert_columns:
+                c.execute(f"ALTER TABLE alerts ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+        c.execute("""UPDATE alerts SET notification_status='failed',
+            notification_info='Phiên gửi bị gián đoạn. Kiểm tra bên nhận trước khi thử lại.'
+            WHERE notification_status='sending'""")
         evidence_columns = {row["name"] for row in c.execute("PRAGMA table_info(alert_evidence)")}
         if "detections" not in evidence_columns:
             c.execute("ALTER TABLE alert_evidence ADD COLUMN detections TEXT NOT NULL DEFAULT '[]'")
@@ -71,9 +82,12 @@ def init():
         if profile_version < config.DETECTION_SETTINGS_PROFILE_VERSION:
             if profile_version < 3:
                 for key in (
-                        "conf_threshold",
-                        *config.CLASS_THRESHOLD_SETTINGS.values(),
-                        "confirm_frames", "imgsz", "detect_fps"):
+                    "conf_threshold",
+                    *config.CLASS_THRESHOLD_SETTINGS.values(),
+                    "confirm_frames",
+                    "imgsz",
+                    "detect_fps",
+                ):
                     c.execute(
                         "INSERT OR REPLACE INTO settings VALUES(?,?)",
                         (key, json.dumps(config.DEFAULT_SETTINGS[key])),
@@ -90,8 +104,10 @@ def init():
                     )
             c.execute(
                 "INSERT OR REPLACE INTO settings VALUES(?,?)",
-                ("detection_profile_version",
-                 json.dumps(config.DETECTION_SETTINGS_PROFILE_VERSION)),
+                (
+                    "detection_profile_version",
+                    json.dumps(config.DETECTION_SETTINGS_PROFILE_VERSION),
+                ),
             )
         legacy_chat_id = c.execute(
             "SELECT value FROM settings WHERE key='telegram_chat_id'"
@@ -106,7 +122,10 @@ def init():
             c.execute("DELETE FROM settings WHERE key='telegram_chat_id'")
         if not c.execute("SELECT 1 FROM sources").fetchone():
             for s in config.DEFAULT_SOURCES:
-                c.execute("INSERT INTO sources VALUES(:id,:name,:type,:url,:location,:lat,:lon,:enabled)", s)
+                c.execute(
+                    "INSERT INTO sources VALUES(:id,:name,:type,:url,:location,:lat,:lon,:enabled)",
+                    s,
+                )
     _load_settings()
 
 
@@ -115,7 +134,9 @@ def _load_settings():
         rows = c.execute("SELECT key,value FROM settings").fetchall()
     _settings.clear()
     _settings.update(config.DEFAULT_SETTINGS)
-    _settings.update({r["key"]: json.loads(r["value"]) for r in rows if r["key"] in config.DEFAULT_SETTINGS})
+    _settings.update(
+        {r["key"]: json.loads(r["value"]) for r in rows if r["key"] in config.DEFAULT_SETTINGS}
+    )
 
 
 def get_settings():
@@ -123,6 +144,9 @@ def get_settings():
 
 
 def set_settings(data):
+    for key in config.CLASS_ENABLED_SETTINGS.values():
+        if key in data and not isinstance(data[key], bool):
+            raise ValueError(f"{key} must be true or false")
     thresholds = {}
     for key in config.CLASS_THRESHOLD_SETTINGS.values():
         if key not in data:
@@ -157,11 +181,36 @@ def set_settings(data):
     return get_settings()
 
 
+def read_detection_settings():
+    """Read persisted settings for the standalone screen process without writes."""
+    settings = dict(config.DEFAULT_SETTINGS)
+    if config.DB_PATH.is_file():
+        with closing(sqlite3.connect(config.DB_PATH.as_uri() + "?mode=ro", uri=True)) as connection:
+            settings.update(
+                {
+                    key: json.loads(value)
+                    for key, value in connection.execute("SELECT key,value FROM settings")
+                    if key in config.DEFAULT_SETTINGS
+                }
+            )
+    return settings
+
+
+def read_enabled_classes():
+    settings = read_detection_settings()
+    return [
+        label for label, key in config.CLASS_ENABLED_SETTINGS.items() if settings.get(key, True)
+    ]
+
+
 def list_mobile_devices():
     with _db() as c:
-        return [dict(r) for r in c.execute(
-            "SELECT id, name, chat_id, created_at, enabled FROM mobile_devices ORDER BY id"
-        )]
+        return [
+            dict(r)
+            for r in c.execute(
+                "SELECT id, name, chat_id, created_at, enabled FROM mobile_devices ORDER BY id"
+            )
+        ]
 
 
 def add_mobile_device(name, chat_id):
@@ -170,10 +219,12 @@ def add_mobile_device(name, chat_id):
             "INSERT INTO mobile_devices(name, chat_id, created_at) VALUES(?,?,?)",
             (name, chat_id, now()),
         )
-        return dict(c.execute(
-            "SELECT id, name, chat_id, created_at, enabled FROM mobile_devices WHERE id=?",
-            (cur.lastrowid,),
-        ).fetchone())
+        return dict(
+            c.execute(
+                "SELECT id, name, chat_id, created_at, enabled FROM mobile_devices WHERE id=?",
+                (cur.lastrowid,),
+            ).fetchone()
+        )
 
 
 def update_mobile_device(device_id, name=None, enabled=None):
@@ -195,10 +246,12 @@ def update_mobile_device(device_id, name=None, enabled=None):
         )
         if not cur.rowcount:
             return None
-        return dict(c.execute(
-            "SELECT id, name, chat_id, created_at, enabled FROM mobile_devices WHERE id=?",
-            (device_id,),
-        ).fetchone())
+        return dict(
+            c.execute(
+                "SELECT id, name, chat_id, created_at, enabled FROM mobile_devices WHERE id=?",
+                (device_id,),
+            ).fetchone()
+        )
 
 
 def delete_mobile_device(device_id):
@@ -220,7 +273,10 @@ def get_source(sid):
 
 def save_source(s):
     with _db() as c:
-        c.execute("INSERT OR REPLACE INTO sources VALUES(:id,:name,:type,:url,:location,:lat,:lon,:enabled)", s)
+        c.execute(
+            "INSERT OR REPLACE INTO sources VALUES(:id,:name,:type,:url,:location,:lat,:lon,:enabled)",
+            s,
+        )
 
 
 def delete_source(sid):
@@ -231,30 +287,36 @@ def delete_source(sid):
 def _alert(c, r):
     d = dict(r)
     d["weapons"] = [
-        {**weapon, "label": normalize_label(weapon["label"])}
-        for weapon in json.loads(d["weapons"])
+        {**weapon, "label": normalize_label(weapon["label"])} for weapon in json.loads(d["weapons"])
     ]
     d["summary"] = normalize_summary(json.loads(d["summary"]))
     d["detections"] = [
         {**detection, "label": normalize_label(detection["label"])}
         for detection in json.loads(d.get("detections") or "[]")
     ]
-    d["events"] = [dict(e) for e in c.execute(
-        "SELECT ts,text FROM alert_events WHERE alert_id=? ORDER BY id", (d["id"],))]
+    d["events"] = [
+        dict(e)
+        for e in c.execute(
+            "SELECT ts,text FROM alert_events WHERE alert_id=? ORDER BY id", (d["id"],)
+        )
+    ]
     for event in d["events"]:
         event["text"] = normalize_text(event["text"])
     d["evidence_images"] = []
     for evidence in c.execute(
-            "SELECT image,detections,captured_at FROM alert_evidence WHERE alert_id=? ORDER BY id",
-            (d["id"],)):
-        d["evidence_images"].append({
-            "image": evidence["image"],
-            "detections": [
-                {**detection, "label": normalize_label(detection["label"])}
-                for detection in json.loads(evidence["detections"] or "[]")
-            ],
-            "captured_at": evidence["captured_at"],
-        })
+        "SELECT image,detections,captured_at FROM alert_evidence WHERE alert_id=? ORDER BY id",
+        (d["id"],),
+    ):
+        d["evidence_images"].append(
+            {
+                "image": evidence["image"],
+                "detections": [
+                    {**detection, "label": normalize_label(detection["label"])}
+                    for detection in json.loads(evidence["detections"] or "[]")
+                ],
+                "captured_at": evidence["captured_at"],
+            }
+        )
     return d
 
 
@@ -263,26 +325,39 @@ def _event(c, aid, text):
 
 
 def create_alert(src, dets, image, evidence_images=()):
-    weapons = [
-        {"label": normalize_label(d["label"]), "conf": d["conf"]}
-        for d in dets
-    ]
+    weapons = [{"label": normalize_label(d["label"]), "conf": d["conf"]} for d in dets]
     summary = dict(Counter(weapon["label"] for weapon in weapons))
-    serialized_detections = json.dumps([
-        {
-            "label": normalize_label(detection["label"]),
-            "conf": detection["conf"],
-            **({"box": list(detection["box"])} if detection.get("box") is not None else {}),
-        }
-        for detection in dets
-    ])
+    serialized_detections = json.dumps(
+        [
+            {
+                "label": normalize_label(detection["label"]),
+                "conf": detection["conf"],
+                **({"box": list(detection["box"])} if detection.get("box") is not None else {}),
+            }
+            for detection in dets
+        ]
+    )
     with _db() as c:
         cur = c.execute(
             """INSERT INTO alerts(created_at,status,source_id,source_name,source_type,location,lat,lon,
                weapons,summary,total,max_conf,image,detections) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (now(), "pending", src["id"], src["name"], src["type"], src.get("location") or "",
-             src.get("lat"), src.get("lon"), json.dumps(weapons), json.dumps(summary),
-             len(dets), max(d["conf"] for d in dets), image, serialized_detections))
+            (
+                now(),
+                "pending",
+                src["id"],
+                src["name"],
+                src["type"],
+                src.get("location") or "",
+                src.get("lat"),
+                src.get("lon"),
+                json.dumps(weapons),
+                json.dumps(summary),
+                len(dets),
+                max(d["conf"] for d in dets),
+                image,
+                serialized_detections,
+            ),
+        )
         _event(c, cur.lastrowid, f"Phát hiện {', '.join(f'{n} {k}' for k, n in summary.items())}")
         c.executemany(
             "INSERT INTO alert_evidence(alert_id,image) VALUES(?,?)",
@@ -292,14 +367,16 @@ def create_alert(src, dets, image, evidence_images=()):
 
 
 def add_alert_evidence(aid, image, detections, captured_at):
-    serialized_detections = json.dumps([
-        {
-            "label": normalize_label(detection["label"]),
-            "conf": detection["conf"],
-            **({"box": list(detection["box"])} if detection.get("box") is not None else {}),
-        }
-        for detection in detections
-    ])
+    serialized_detections = json.dumps(
+        [
+            {
+                "label": normalize_label(detection["label"]),
+                "conf": detection["conf"],
+                **({"box": list(detection["box"])} if detection.get("box") is not None else {}),
+            }
+            for detection in detections
+        ]
+    )
     with _db() as c:
         if not c.execute("SELECT 1 FROM alerts WHERE id=?", (aid,)).fetchone():
             return False
@@ -311,11 +388,19 @@ def add_alert_evidence(aid, image, detections, captured_at):
 
 
 def list_alerts(group="pending", limit=200):
-    where = {"pending": "status='pending'", "history": "status!='pending'", "all": "1=1"}[group]
+    where = {
+        "pending": "status IN ('pending','confirmed','dispatched')",
+        "history": "status!='pending'",
+        "all": "1=1",
+    }[group]
     order = "ASC" if group == "pending" else "DESC"
     with _db() as c:
-        return [_alert(c, r) for r in c.execute(
-            f"SELECT * FROM alerts WHERE {where} ORDER BY id {order} LIMIT ?", (limit,))]
+        return [
+            _alert(c, r)
+            for r in c.execute(
+                f"SELECT * FROM alerts WHERE {where} ORDER BY id {order} LIMIT ?", (limit,)
+            )
+        ]
 
 
 def get_alert(aid):
@@ -324,21 +409,146 @@ def get_alert(aid):
         return _alert(c, r) if r else None
 
 
-def set_status(aid, status, by):
+def export_alerts(status="all"):
+    filters = {
+        "all": "1=1",
+        "processed": "status!='pending'",
+        **{
+            key: "status=?"
+            for key in ("pending", "confirmed", "dispatched", "completed", "deleted")
+        },
+    }
+    if status not in filters:
+        raise ValueError("Invalid status")
     with _db() as c:
-        cur = c.execute("UPDATE alerts SET status=?,handled_at=?,handled_by=? WHERE id=? AND status='pending'",
-                        (status, now(), by, aid))
+        parameters = (status,) if filters[status] == "status=?" else ()
+        return [
+            _alert(c, row)
+            for row in c.execute(
+                "SELECT * FROM alerts WHERE " + filters[status] + " ORDER BY id DESC", parameters
+            )
+        ]
+
+
+def review_false_alarm(aid, by, reason, actual_label="", note=""):
+    with _db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        result = c.execute(
+            """UPDATE alerts SET status='deleted',handled_at=?,handled_by=?,
+            review_reason=?,actual_label=?,review_note=? WHERE id=? AND notification_status!='sending'""",
+            (now(), by, reason, actual_label, note, aid),
+        )
+        if result.rowcount:
+            _event(c, aid, f"Nhận diện sai bởi {by}")
+            _event(
+                c,
+                aid,
+                f"Ghi chú ({by}): Lý do nhận diện sai: {reason}"
+                + (f"; Nhãn thực tế: {actual_label}" if actual_label else "")
+                + (f"; {note}" if note else ""),
+            )
+        return result.rowcount > 0
+
+
+def set_status(aid, status, by):
+    transitions = {
+        "confirmed": ("pending",),
+        "dispatched": ("pending", "confirmed"),
+        "completed": ("confirmed", "dispatched"),
+        "deleted": ("pending",),
+    }
+    if status not in transitions:
+        return False
+    with _db() as c:
+        placeholders = ",".join("?" for _ in transitions[status])
+        cur = c.execute(
+            f"UPDATE alerts SET status=?,handled_at=?,handled_by=? WHERE id=? AND status IN ({placeholders}) AND notification_status!='sending'",
+            (status, now(), by, aid, *transitions[status]),
+        )
         if cur.rowcount:
-            _event(c, aid, f"{'Dispatched' if status == 'dispatched' else 'Deleted (false alarm)'} bởi {by}")
+            names = {
+                "confirmed": "Đã xác nhận",
+                "dispatched": "Đã gửi thông báo",
+                "completed": "Đã hoàn tất",
+                "deleted": "Nhận diện sai",
+            }
+            _event(c, aid, f"{names[status]} bởi {by}")
         return cur.rowcount > 0
+
+
+def begin_dispatch(aid, by):
+    with _db() as c:
+        cur = c.execute(
+            """UPDATE alerts SET status='confirmed', notification_status='sending',
+            handled_at=?, handled_by=? WHERE id=? AND status IN ('pending','confirmed')
+            AND notification_status!='sending'""",
+            (now(), by, aid),
+        )
+        if cur.rowcount:
+            _event(c, aid, f"Xác nhận và yêu cầu gửi thông báo bởi {by}")
+        return cur.rowcount > 0
+
+
+def finish_dispatch(aid, delivered, info, logged_only=False):
+    with _db() as c:
+        c.execute(
+            """UPDATE alerts SET status=?, notification_status=?, notification_info=?
+            WHERE id=? AND notification_status='sending'""",
+            (
+                "dispatched" if delivered else "confirmed",
+                "sent" if delivered else "logged" if logged_only else "failed",
+                info,
+                aid,
+            ),
+        )
+        _event(c, aid, info)
+
+
+def purge_alert(aid, by):
+    """Remove an alert without assigning any recognition verdict."""
+    with _db() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT image,notification_status FROM alerts WHERE id=?", (aid,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["notification_status"] == "sending":
+            return False
+        images = {
+            row["image"],
+            *(
+                r["image"]
+                for r in c.execute("SELECT image FROM alert_evidence WHERE alert_id=?", (aid,))
+            ),
+        }
+        c.execute("DELETE FROM alert_evidence WHERE alert_id=?", (aid,))
+        c.execute("DELETE FROM alert_events WHERE alert_id=?", (aid,))
+        c.execute("DELETE FROM alerts WHERE id=?", (aid,))
+        c.execute(
+            "INSERT INTO logs(ts,level,subject,info) VALUES(?,?,?,?)",
+            (now(), "INFO", f"Xóa cảnh báo #{aid}", by),
+        )
+        return [
+            image
+            for image in images
+            if image
+            and not c.execute(
+                "SELECT 1 FROM alerts WHERE image=? UNION ALL SELECT 1 FROM alert_evidence WHERE image=? LIMIT 1",
+                (image, image),
+            ).fetchone()
+        ]
 
 
 def clear_pending(by):
     with _db() as c:
         ids = [r["id"] for r in c.execute("SELECT id FROM alerts WHERE status='pending'")]
         for i in ids:
-            c.execute("UPDATE alerts SET status='deleted',handled_at=?,handled_by=? WHERE id=?", (now(), by, i))
-            _event(c, i, f"Deleted (clear all) bởi {by}")
+            c.execute(
+                "UPDATE alerts SET status='deleted',handled_at=?,handled_by=? WHERE id=?",
+                (now(), by, i),
+            )
+            _event(c, i, f"Nhận diện sai (xử lý hàng loạt) bởi {by}")
     return len(ids)
 
 
@@ -352,7 +562,9 @@ def add_note(aid, text, by):
 
 def log(level, subject, info=""):
     with _db() as c:
-        c.execute("INSERT INTO logs(ts,level,subject,info) VALUES(?,?,?,?)", (now(), level, subject, info))
+        c.execute(
+            "INSERT INTO logs(ts,level,subject,info) VALUES(?,?,?,?)", (now(), level, subject, info)
+        )
 
 
 def list_logs(limit=200):
@@ -364,23 +576,55 @@ def list_logs(limit=200):
     return rows
 
 
-def stats():
+def stats(days=7):
+    if days not in (7, 30):
+        raise ValueError("Chỉ hỗ trợ 7 hoặc 30 ngày")
     with _db() as c:
-        q = lambda sql, *a: c.execute(sql, a).fetchone()[0]
+
+        def q(sql, *args):
+            return c.execute(sql, args).fetchone()[0]
+
         today = datetime.now().strftime("%Y-%m-%d")
-        out = {"today": q("SELECT COUNT(*) FROM alerts WHERE created_at>=?", today),
-               "total": q("SELECT COUNT(*) FROM alerts")}
-        for st in ("pending", "dispatched", "deleted"):
+        out = {
+            "today": q("SELECT COUNT(*) FROM alerts WHERE created_at>=?", today),
+            "total": q("SELECT COUNT(*) FROM alerts"),
+        }
+        for st in ("pending", "confirmed", "dispatched", "completed", "deleted"):
             out[st] = q("SELECT COUNT(*) FROM alerts WHERE status=?", st)
+        out["notification_failures"] = q(
+            "SELECT COUNT(*) FROM alerts WHERE status='confirmed' AND notification_status='failed'"
+        )
+        out["days"] = days
+        since = (datetime.now() - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        out["period_total"] = q("SELECT COUNT(*) FROM alerts WHERE created_at>=?", since)
+        out["period_status"] = {
+            row["status"]: row["count"]
+            for row in c.execute(
+                "SELECT status, COUNT(*) AS count FROM alerts WHERE created_at>=? GROUP BY status",
+                (since,),
+            )
+        }
+        out["by_source"] = [
+            dict(row)
+            for row in c.execute(
+                """SELECT source_id, source_name, COUNT(*) AS count FROM alerts
+            WHERE created_at>=? GROUP BY source_id ORDER BY count DESC, source_id LIMIT 5""",
+                (since,),
+            )
+        ]
         per_day = []
-        for i in range(6, -1, -1):
+        for i in range(days - 1, -1, -1):
             d = (datetime.now() - timedelta(days=i)).strftime("%Y-%m-%d")
             row = {"date": d[5:]}
-            for st in ("dispatched", "deleted", "pending"):
-                row[st] = q("SELECT COUNT(*) FROM alerts WHERE substr(created_at,1,10)=? AND status=?", d, st)
+            for st in ("dispatched", "deleted", "pending", "confirmed", "completed"):
+                row[st] = q(
+                    "SELECT COUNT(*) FROM alerts WHERE substr(created_at,1,10)=? AND status=?",
+                    d,
+                    st,
+                )
             per_day.append(row)
         weapons = Counter()
-        for r in c.execute("SELECT summary FROM alerts ORDER BY id DESC LIMIT 500"):
+        for r in c.execute("SELECT summary FROM alerts WHERE created_at>=?", (since,)):
             weapons.update(normalize_summary(json.loads(r[0])))
         out["per_day"], out["by_weapon"] = per_day, dict(weapons)
     out["recent"] = list_alerts("all", 5)

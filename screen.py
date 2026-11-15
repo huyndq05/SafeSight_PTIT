@@ -9,15 +9,19 @@ import mss
 import numpy as np
 
 from weapon_detection import config
+from weapon_detection.storage import db
 from weapon_detection.detection.model import (
-    WeaponDetector, draw_detections, draw_stamp,
+    WeaponDetector,
+    draw_detections,
+    draw_stamp,
 )
 from weapon_detection.detection.streams import DetectionTracker
 
 
 class LatestScreenCapture:
-    def __init__(self, region):
+    def __init__(self, region, fps=30.0):
         self._region = region
+        self._interval = 1.0 / fps
         self._condition = threading.Condition()
         self._stop_event = threading.Event()
         self._frame = None
@@ -32,9 +36,11 @@ class LatestScreenCapture:
     def read(self, after_sequence):
         with self._condition:
             self._condition.wait_for(
-                lambda: self._sequence > after_sequence
-                or self._error is not None
-                or self._stop_event.is_set()
+                lambda: (
+                    self._sequence > after_sequence
+                    or self._error is not None
+                    or self._stop_event.is_set()
+                )
             )
             if self._error is not None:
                 raise RuntimeError("Screen capture failed.") from self._error
@@ -59,15 +65,17 @@ class LatestScreenCapture:
         try:
             with mss.MSS() as capture:
                 while not self._stop_event.is_set():
-                    frame = cv2.cvtColor(
-                        np.asarray(capture.grab(self._region)), cv2.COLOR_BGRA2BGR
-                    )
+                    started = time.perf_counter()
+                    frame = cv2.cvtColor(np.asarray(capture.grab(self._region)), cv2.COLOR_BGRA2BGR)
                     captured_at = time.monotonic()
                     with self._condition:
                         self._frame = frame
                         self._captured_at = captured_at
                         self._sequence += 1
                         self._condition.notify_all()
+                    self._stop_event.wait(
+                        max(0.0, self._interval - (time.perf_counter() - started))
+                    )
         except Exception as error:
             with self._condition:
                 self._error = error
@@ -75,48 +83,69 @@ class LatestScreenCapture:
 
 
 def parse_args():
+    saved_settings = db.read_detection_settings()
     parser = argparse.ArgumentParser(
         description="Capture the screen and run YOLO weapon detection."
     )
     parser.add_argument(
-        "--monitor", type=int, default=1,
+        "--monitor",
+        type=int,
+        default=1,
         help="MSS monitor number, default: 1. Use --list-monitors to list monitors.",
     )
     parser.add_argument(
-        "--list-monitors", action="store_true",
+        "--list-monitors",
+        action="store_true",
         help="List available monitors and exit.",
     )
     parser.add_argument(
-        "--region", type=int, nargs=4, metavar=("LEFT", "TOP", "WIDTH", "HEIGHT"),
+        "--region",
+        type=int,
+        nargs=4,
+        metavar=("LEFT", "TOP", "WIDTH", "HEIGHT"),
         help="Capture only a region, relative to the selected monitor.",
     )
     parser.add_argument(
-        "--conf", type=float, default=config.DEFAULT_SETTINGS["conf_threshold"],
-        help="Confidence threshold, default: %(default)s.",
+        "--conf",
+        type=float,
+        default=None,
+        help="Override confidence for all classes; otherwise use saved class thresholds.",
     )
     parser.add_argument(
-        "--imgsz", type=int, default=config.DEFAULT_SETTINGS["imgsz"],
+        "--imgsz",
+        type=int,
+        default=saved_settings["imgsz"],
         help="Model input size, default: %(default)s.",
     )
     parser.add_argument(
-        "--fps", type=float, default=30.0,
+        "--fps",
+        type=float,
+        default=30.0,
         help="Maximum preview and detection rate (default: %(default)s); "
-             "the model may update detections more slowly.",
+        "the model may update detections more slowly.",
     )
     parser.add_argument(
-        "--model", type=Path,
+        "--model",
+        type=Path,
         default=config.MODEL_PATH,
         help="YOLO weights file, default: %(default)s.",
     )
     parser.add_argument(
-        "--class-conf", action="append", default=[], metavar="CLASS=VALUE",
+        "--class-conf",
+        action="append",
+        default=[],
+        metavar="CLASS=VALUE",
         help="Confidence threshold for a class (0-1); may be repeated.",
     )
     args = parser.parse_args()
+    conf_override = args.conf is not None
+    if args.conf is None:
+        args.conf = saved_settings["conf_threshold"]
     if not math.isfinite(args.conf) or not 0 <= args.conf <= 1:
         parser.error("--conf must be between 0 and 1")
     args.class_thresholds = {
-        label: args.conf for label in config.MODEL_CLASSES
+        label: args.conf if conf_override else saved_settings[key]
+        for label, key in config.CLASS_THRESHOLD_SETTINGS.items()
     }
     for item in args.class_conf:
         try:
@@ -125,9 +154,7 @@ def parse_args():
         except ValueError:
             parser.error(f"--class-conf must use CLASS=VALUE: {item}")
         if label not in config.MODEL_CLASSES:
-            parser.error(
-                f"unknown class {label!r}; choose from {', '.join(config.MODEL_CLASSES)}"
-            )
+            parser.error(f"unknown class {label!r}; choose from {', '.join(config.MODEL_CLASSES)}")
         if not math.isfinite(threshold) or not 0 <= threshold <= 1:
             parser.error(f"--class-conf value must be between 0 and 1: {item}")
         args.class_thresholds[label] = threshold
@@ -135,18 +162,25 @@ def parse_args():
         parser.error("--imgsz must be greater than 0")
     if args.fps <= 0:
         parser.error("--fps must be greater than 0")
-    if args.region and (args.region[0] < 0 or args.region[1] < 0
-                        or args.region[2] < 1 or args.region[3] < 1):
+    if args.region and (
+        args.region[0] < 0 or args.region[1] < 0 or args.region[2] < 1 or args.region[3] < 1
+    ):
         parser.error("--region requires LEFT/TOP >= 0 and WIDTH/HEIGHT > 0")
     return args
 
 
-def detect(model, frame, conf, imgsz, class_thresholds=None):
+def detect(
+    model, frame, conf, imgsz, class_thresholds=None, enabled_classes=None, detail_scan=False
+):
     thresholds = class_thresholds or {}
     return model.detect(
-        frame, min([conf, *thresholds.values()]), imgsz,
+        frame,
+        min([conf, *thresholds.values()]),
+        imgsz,
         class_thresholds=thresholds,
         default_conf=conf,
+        enabled_classes=enabled_classes,
+        detail_scan=detail_scan,
     )
 
 
@@ -169,12 +203,14 @@ def main():
             if left + width > monitor["width"] or top + height > monitor["height"]:
                 raise SystemExit("--region must fit inside the selected monitor.")
             region = dict(monitor)
-            region.update({
-                "left": monitor["left"] + left,
-                "top": monitor["top"] + top,
-                "width": width,
-                "height": height,
-            })
+            region.update(
+                {
+                    "left": monitor["left"] + left,
+                    "top": monitor["top"] + top,
+                    "width": width,
+                    "height": height,
+                }
+            )
         else:
             left_offset = monitor["width"] // 2
             region = {
@@ -185,13 +221,21 @@ def main():
 
         if not args.model.is_file():
             raise SystemExit(f"YOLO model file not found: {args.model}")
+        # Leave CPU capacity for capture and preview while YOLO runs.
+        import torch
+
+        if not torch.cuda.is_available():
+            torch.set_num_threads(min(4, torch.get_num_threads()))
+        cv2.setNumThreads(1)
         detector = WeaponDetector(args.model)
         print(f"Screen detector: YOLO {args.model.name}, device={detector.device}")
 
         print("Screen detection running. Press q or Esc in the preview to quit.")
         if not args.region:
-            print("Capturing the right half of the selected monitor. Use --region "
-                  "to choose another area.")
+            print(
+                "Capturing the right half of the selected monitor. Use --region "
+                "to choose another area."
+            )
             print("Move the preview outside the capture area to avoid capturing it.")
 
         window_name = "SAFESIGHT - Screen Detection"
@@ -208,15 +252,20 @@ def main():
             max(1, round(region["width"] * preview_scale)),
             max(1, round(region["height"] * preview_scale)),
         )
-        screen_capture = LatestScreenCapture(region)
+        screen_capture = LatestScreenCapture(region, args.fps)
         screen_capture.start()
-        tracker = DetectionTracker()
+        tracker = DetectionTracker(max_misses=4)
         tracker_lock = threading.Lock()
         detection_error = []
+        detail_scan = db.read_detection_settings().get("detail_scan", False)
+        inference_stats = {"seconds": 0.0}
 
         def detect_loop():
             last_sequence = 0
+            enabled_classes, switches_at = db.read_enabled_classes(), time.monotonic()
             while not screen_capture.stopped:
+                if time.monotonic() - switches_at >= 1.0:
+                    enabled_classes, switches_at = db.read_enabled_classes(), time.monotonic()
                 sequence, frame, captured_at = screen_capture.read(last_sequence)
                 if frame is None:
                     return
@@ -224,18 +273,29 @@ def main():
                 started = time.perf_counter()
                 try:
                     detections = detect(
-                        detector, frame, args.conf, args.imgsz,
+                        detector,
+                        frame,
+                        args.conf,
+                        args.imgsz,
                         args.class_thresholds,
+                        enabled_classes,
+                        detail_scan,
                     )
                     with tracker_lock:
+                        tracker._tracks = {
+                            key: value
+                            for key, value in tracker._tracks.items()
+                            if value["detection"]["label"] in enabled_classes
+                        }
+                        latency = time.monotonic() - captured_at
+                        tracker.ttl = min(2.5, max(0.8, latency * 3))
                         tracker.update(detections, captured_at)
+                        inference_stats["seconds"] = time.perf_counter() - started
                 except Exception as error:
                     detection_error.append(error)
                     screen_capture.stop()
                     return
-                screen_capture.wait(
-                    max(0.0, interval - (time.perf_counter() - started))
-                )
+                screen_capture.wait(max(0.0, interval - (time.perf_counter() - started)))
 
         detection_thread = threading.Thread(target=detect_loop, daemon=True)
         detection_thread.start()
@@ -251,12 +311,15 @@ def main():
                     break
                 with tracker_lock:
                     detections = tracker.current()
+                    inference_seconds = inference_stats["seconds"]
                 elapsed = started - last_rendered_at
                 last_rendered_at = started
                 output = draw_detections(frame.copy(), detections)
                 draw_stamp(
                     output,
-                    f"FPS {1 / max(elapsed, 1e-6):.1f}  "
+                    f"Preview {1 / max(elapsed, 1e-6):.1f} FPS  "
+                    f"Detect {1 / max(inference_seconds, interval):.1f} FPS "
+                    f"({inference_seconds * 1000:.0f} ms)  "
                     f"Objects {len(detections)}  q/Esc: quit",
                 )
                 cv2.imshow(window_name, output)

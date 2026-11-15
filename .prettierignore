@@ -1,0 +1,6 @@
+data/
+models/
+runs/
+venv/
+.venv/
+node_modules/

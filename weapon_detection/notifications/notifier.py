@@ -1,5 +1,3 @@
-
-
 from datetime import datetime
 
 import requests
@@ -15,9 +13,13 @@ def build_message(a):
     detail = ", ".join(f"{n} {k}" for k, n in a["summary"].items())
     lines = [
         "CẢNH BÁO HUNG KHÍ - ĐÃ XÁC NHẬN",
-        f"Địa điểm: {s['site_name']} / {a['location'] or '-'}",
+        f"Địa điểm: {str(s.get('site_name') or '').strip() or 'Chưa khai báo địa điểm hệ thống'}",
         f"Nguồn: {a['source_name']} ({a['source_type']})",
+        f"Vị trí camera: {str(a.get('location') or '').strip() or 'Chưa khai báo vị trí chi tiết'}",
     ]
+    address = str(s.get("site_address") or "").strip()
+    if address:
+        lines.insert(2, f"Địa chỉ: {address}")
     if a.get("lat") is not None and a.get("lon") is not None:
         lines.append(f"Tọa độ: {a['lat']}, {a['lon']}")
     lines += [
@@ -33,10 +35,16 @@ def _telegram(text, chat_id, image_path=None):
     base = f"https://api.telegram.org/bot{s['telegram_token']}"
     if image_path:
         with open(image_path, "rb") as f:
-            r = requests.post(f"{base}/sendPhoto", data={"chat_id": chat_id, "caption": text[:1000]},
-                              files={"photo": f}, timeout=20)
+            r = requests.post(
+                f"{base}/sendPhoto",
+                data={"chat_id": chat_id, "caption": text[:1000]},
+                files={"photo": f},
+                timeout=20,
+            )
     else:
-        r = requests.post(f"{base}/sendMessage", data={"chat_id": chat_id, "text": text}, timeout=20)
+        r = requests.post(
+            f"{base}/sendMessage", data={"chat_id": chat_id, "text": text}, timeout=20
+        )
     r.raise_for_status()
 
 

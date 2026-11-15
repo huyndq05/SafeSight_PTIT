@@ -74,6 +74,7 @@ class WeaponDetectorModelTests(unittest.TestCase):
                     "rifle": 0.65,
                 },
                 default_conf=0.5,
+                cascade=False,
             )
 
         self.assertEqual(created["model_path"], "test-ss-final-1.pt")
@@ -87,13 +88,15 @@ class WeaponDetectorModelTests(unittest.TestCase):
         self.assertEqual(detections[0]["box"], (10, 20, 30, 40))
         self.assertNotIn("rifle", [item["label"] for item in detections])
 
-    def test_suppresses_nested_cross_class_boxes_for_the_same_object(self):
-        detections = model._suppress_cross_class_duplicates([
-            {"label": "pistol", "conf": 0.36, "box": (31, 34, 180, 204)},
-            {"label": "rifle", "conf": 0.42, "box": (28, 30, 382, 207)},
-        ])
+    def test_preserves_nested_different_classes_during_occlusion(self):
+        detections = model._suppress_cross_class_duplicates(
+            [
+                {"label": "pistol", "conf": 0.36, "box": (31, 34, 180, 204)},
+                {"label": "rifle", "conf": 0.42, "box": (28, 30, 382, 207)},
+            ]
+        )
 
-        self.assertEqual([item["label"] for item in detections], ["rifle"])
+        self.assertEqual([item["label"] for item in detections], ["rifle", "pistol"])
 
 
 class DetectionTrackerTests(unittest.TestCase):
@@ -140,7 +143,8 @@ class DetectionTrackerTests(unittest.TestCase):
             now = 1.0 + index / 30
             center_x = 100 + index * 12 + (4 if index % 2 else -4)
             detection = {
-                "label": "knife", "conf": 0.9,
+                "label": "knife",
+                "conf": 0.9,
                 "box": (center_x - 15, 80, center_x + 15, 110),
             }
             tracked = self.tracker.update([detection], now=now)
@@ -185,8 +189,7 @@ class DetectionTrackerTests(unittest.TestCase):
         frame = type("Frame", (), {"shape": (100, 100, 3)})()
         detection = {"label": "knife", "conf": 0.9, "box": (10, 10, 40, 40)}
 
-        with patch.object(model.cv2, "rectangle") as rectangle, \
-                patch.object(model.cv2, "putText"):
+        with patch.object(model.cv2, "rectangle") as rectangle, patch.object(model.cv2, "putText"):
             model.draw_detections(frame, [detection])
 
         self.assertEqual(rectangle.call_args_list[0].args[-1], 4)
@@ -198,9 +201,7 @@ class DetectionSettingsMigrationTests(unittest.TestCase):
             db_path = Path(temp_dir) / "settings.db"
             connection = sqlite3.connect(db_path)
             try:
-                connection.execute(
-                    "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)"
-                )
+                connection.execute("CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)")
                 connection.executemany(
                     "INSERT INTO settings VALUES(?, ?)",
                     [
@@ -232,10 +233,12 @@ class DetectionSettingsMigrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with patch.object(config, "DB_PATH", Path(temp_dir) / "settings.db"):
                 db.init()
-                settings = db.set_settings({
-                    "axe_conf_threshold": 0.73,
-                    "baseball_bat_conf_threshold": 0.32,
-                })
+                settings = db.set_settings(
+                    {
+                        "axe_conf_threshold": 0.73,
+                        "baseball_bat_conf_threshold": 0.32,
+                    }
+                )
 
                 self.assertEqual(settings["axe_conf_threshold"], 0.73)
                 self.assertEqual(settings["baseball_bat_conf_threshold"], 0.32)
@@ -246,8 +249,12 @@ class DetectionSettingsMigrationTests(unittest.TestCase):
 class StartupTests(unittest.TestCase):
     def test_missing_model_reports_the_required_weights_path(self):
         missing_model = Path("models") / "missing-ss-final-1.pt"
-        with patch.object(web_app.config, "MODEL_PATH", missing_model):
-            with self.assertRaisesRegex(FileNotFoundError, "ss_final_1.pt"):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(web_app.config, "BASE_DIR", Path(directory)),
+            patch.object(web_app.config, "MODEL_PATH", missing_model),
+        ):
+            with self.assertRaisesRegex(FileNotFoundError, "ss_final_2.pt"):
                 web_app.main()
 
 

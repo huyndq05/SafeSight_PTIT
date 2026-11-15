@@ -1,0 +1,12 @@
+{
+  "name": "safesight-ui-tools",
+  "private": true,
+  "scripts": {
+    "format": "prettier --write static/**/*.js static/**/*.css templates/*.html tests/*.cjs",
+    "format:check": "prettier --check static/**/*.js static/**/*.css templates/*.html tests/*.cjs",
+    "test:js": "node --check static/js/app.js && node tests/test_video_overlay.cjs && node tests/test_detection_sizing.cjs && node tests/test_alert_location.cjs"
+  },
+  "devDependencies": {
+    "prettier": "^3.10.0"
+  }
+}

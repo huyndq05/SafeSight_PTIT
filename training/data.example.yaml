@@ -1,0 +1,17 @@
+# Copy and replace path with the absolute directory of the REVIEWED dataset.
+# Labels must already be remapped to the exact IDs below.
+path: E:/datasets/safesight_v2
+train: images/train
+val: images/val
+test: images/test
+names:
+  0: axe
+  1: baseball_bat
+  2: hammer
+  3: pistol
+  4: knife
+  5: sword
+  6: rifle
+  7: machete
+  8: stick
+  9: spear

@@ -2,8 +2,8 @@
 setlocal
 cd /d "%~dp0"
 
-if not exist "models\ss_final_1.pt" (
-  echo ERROR: Missing models\ss_final_1.pt
+if not exist "models\ss_final_2.pt" (
+  echo ERROR: Missing models\ss_final_2.pt
   echo Copy the trained model into the models folder before setup.
   pause
   exit /b 1

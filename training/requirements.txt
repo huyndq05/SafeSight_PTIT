@@ -1,0 +1,2 @@
+# Optional tools for streaming large public annotation files.
+ijson==3.6.0

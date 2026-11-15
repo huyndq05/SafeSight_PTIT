@@ -3,7 +3,9 @@ import re
 import sqlite3
 
 
-os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay")
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay"
+)
 
 import time
 import uuid
@@ -13,12 +15,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 from flask import Flask, Response, abort, jsonify, render_template, request, send_from_directory
+from flask import g
 
 from weapon_detection import config
 from weapon_detection.detection import streams as manager
-from weapon_detection.detection.model import WeaponDetector, draw_detections, draw_stamp
+from weapon_detection.detection import offline
+from weapon_detection.detection.model import WeaponDetector, draw_stamp, detect_frame
+from weapon_detection.detection.presentation import DETECTION_STYLE
 from weapon_detection.notifications import notifier
 from weapon_detection.storage import db
+from weapon_detection.runtime import single_instance
 
 app = Flask(
     __name__,
@@ -27,6 +33,15 @@ app = Flask(
 )
 app.config["MAX_CONTENT_LENGTH"] = config.MAX_DEMO_VIDEO_BYTES + 1024 * 1024
 detector = None
+from weapon_detection.web.auth import install as install_auth
+
+install_auth(app)
+from weapon_detection.web.preferences import install as install_preferences, get_preferences
+
+install_preferences(app)
+from weapon_detection.web.exports import install as install_exports
+
+install_exports(app)
 MAX_FRAME_BYTES = 20 * 1024 * 1024
 MAX_REQUEST_BYTES = 20 * 1024 * 1024
 
@@ -44,13 +59,15 @@ def enforce_request_size():
 
 
 def operator():
+    if getattr(g, "user", None):
+        return g.user["display_name"]
     return db.get_settings()["operator"]
 
 
 def on_detect(src, frame, dets):
-    name = f'{src["id"]}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg'
+    name = f"{src['id']}_{datetime.now():%Y%m%d_%H%M%S_%f}.jpg"
     image = frame.copy()
-    draw_stamp(image, f'{src["name"]}  {datetime.now():%Y-%m-%d %H:%M:%S}')
+    draw_stamp(image, f"{src['name']}  {datetime.now():%Y-%m-%d %H:%M:%S}")
     if not cv2.imwrite(str(config.ALERT_DIR / name), image):
         raise OSError(f"Không thể lưu ảnh cảnh báo: {name}")
     aid = db.create_alert(src, dets, name)
@@ -61,12 +78,12 @@ def on_detect(src, frame, dets):
 
 
 def on_evidence(aid, src, frame, dets, captured_at, index):
-    name = f'{src["id"]}_{datetime.now():%Y%m%d_%H%M%S_%f}_e{index}.jpg'
+    name = f"{src['id']}_{datetime.now():%Y%m%d_%H%M%S_%f}_e{index}.jpg"
     evidence = frame.copy()
-    description = f'Ảnh theo dõi tiếp diễn {index}/5'
+    description = f"Ảnh theo dõi tiếp diễn {index}/5"
     if not dets:
         description += " - không phát hiện lại vật thể mục tiêu"
-    draw_stamp(evidence, f'{description}  {captured_at:%Y-%m-%d %H:%M:%S.%f}')
+    draw_stamp(evidence, f"{description}  {captured_at:%Y-%m-%d %H:%M:%S.%f}")
     if not cv2.imwrite(str(config.ALERT_DIR / name), evidence):
         raise OSError(f"Không thể lưu ảnh bằng chứng: {name}")
     if not db.add_alert_evidence(aid, name, dets, captured_at):
@@ -75,11 +92,17 @@ def on_evidence(aid, src, frame, dets, captured_at, index):
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", detection_style=DETECTION_STYLE)
 
 
 @app.route("/video_feed/<sid>")
 def video_feed(sid):
+    preferences = get_preferences()
+    preferences["hide_boxes"] = False
+    display_width = request.args.get("display_width", type=int)
+    if display_width is not None:
+        preferences["display_width"] = max(160, min(3840, display_width))
+
     def gen():
         last = -1
         while True:
@@ -91,8 +114,9 @@ def video_feed(sid):
                 time.sleep(0.005)
                 continue
             else:
-                last, jpg = w.seq, w.get_jpeg()
+                last, jpg = w.seq, w.get_jpeg(preferences)
             yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+
     return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
@@ -125,14 +149,20 @@ def _clean_source(d, old=None):
             return float(v)
         except (TypeError, ValueError):
             return None
+
     enabled = d.get("enabled", True)
     if isinstance(enabled, str):
         enabled = enabled.lower() in ("true", "1", "yes", "on")
-    return {"id": (old or {}).get("id") or f"{t}-{uuid.uuid4().hex[:6]}", "name": name, "type": t, "url": url,
-            "location": str(d.get("location", "")).strip(),
-            "lat": None if t == "camera" else num(d.get("lat")),
-            "lon": None if t == "camera" else num(d.get("lon")),
-            "enabled": 1 if t == "camera" or enabled else 0}
+    return {
+        "id": (old or {}).get("id") or f"{t}-{uuid.uuid4().hex[:6]}",
+        "name": name,
+        "type": t,
+        "url": url,
+        "location": str(d.get("location", "")).strip(),
+        "lat": None if t == "camera" else num(d.get("lat")),
+        "lon": None if t == "camera" else num(d.get("lon")),
+        "enabled": 1 if t == "camera" or enabled else 0,
+    }
 
 
 def _save_source_from_request(old=None):
@@ -194,6 +224,7 @@ def _save_source_from_request(old=None):
 def _remove_demo_video(filename, sid):
     try:
         (config.VIDEO_DIR / filename).unlink(missing_ok=True)
+        offline.cache_path(filename).unlink(missing_ok=True)
     except PermissionError as error:
         db.log("ERROR", f"Không thể xóa video demo của nguồn {sid}", str(error)[:200])
         return False
@@ -207,11 +238,17 @@ def api_sources():
         w = manager.workers.get(s["id"])
         demo_video = manager.demo_video_filename(s)
         video_available = bool(demo_video and (config.VIDEO_DIR / demo_video).is_file())
-        out.append({**s, "demo_video": video_available,
-                    "video_name": demo_video if video_available else None,
-                    "online": bool((w and w.online) or video_available),
-                    "resolution": w.resolution if w else None, "fps": round(w.fps, 1) if w else 0,
-                    "telemetry": manager.get_telemetry(s["id"])})
+        out.append(
+            {
+                **s,
+                "demo_video": video_available,
+                "video_name": demo_video if video_available else None,
+                "online": bool((w and w.online) or video_available),
+                "resolution": w.resolution if w else None,
+                "fps": round(w.fps, 1) if w else 0,
+                "telemetry": manager.get_telemetry(s["id"]),
+            }
+        )
     return jsonify(out)
 
 
@@ -230,6 +267,61 @@ def api_source_update(sid):
     db.log("INFO", f"Sửa thiết bị {s['name']}", s["type"])
     manager.start(s, detector, on_detect, on_evidence)
     return jsonify(s)
+
+
+@app.route("/api/sources/<sid>/analysis", methods=["GET", "POST"])
+def api_video_analysis(sid):
+    src = db.get_source(sid) or abort(404)
+    filename = manager.demo_video_filename(src)
+    if not filename or not (config.VIDEO_DIR / filename).is_file():
+        abort(400)
+    status = (
+        offline.ensure(filename, detector, manager.get_detection_settings(), force=True)
+        if request.method == "POST"
+        else offline.status(filename)
+    )
+    if status["state"] == "ready" and request.args.get("results") == "1":
+        return send_from_directory(config.VIDEO_DIR, offline.cache_path(filename).name)
+    return jsonify(status)
+
+
+@app.post("/api/sources/<sid>/playback-event")
+def api_video_playback_event(sid):
+    src = db.get_source(sid) or abort(404)
+    filename = manager.demo_video_filename(src)
+    if not filename:
+        abort(400)
+    timeline = offline.load(filename)
+    if timeline is None:
+        abort(409)
+    data = request.get_json(silent=True)
+    index = data.get("index") if isinstance(data, dict) else None
+    if type(index) is not int or not 0 <= index < len(timeline["frames"]):
+        abort(400)
+    item = timeline["frames"][index]
+    settings = manager.get_detection_settings()
+    detections = [
+        d
+        for d in item["detections"]
+        if settings.get(config.CLASS_ENABLED_SETTINGS[d["label"]], True)
+    ]
+    cap = cv2.VideoCapture(str(config.VIDEO_DIR / filename))
+    try:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    if ok:
+        manager.process_demo_detections(
+            src,
+            frame,
+            detections,
+            on_detect,
+            lambda aid, evidence_frame, evidence_dets, captured_at, evidence_index: on_evidence(
+                aid, src, evidence_frame, evidence_dets, captured_at, evidence_index
+            ),
+        )
+    return jsonify(ok=ok)
 
 
 @app.delete("/api/sources/<sid>")
@@ -263,19 +355,15 @@ def api_source_frame(sid):
         return jsonify(error="Mô hình chưa được khởi tạo"), 503
     settings = manager.get_detection_settings()
     started = time.perf_counter()
-    class_thresholds = {
-        label: settings[key]
-        for label, key in config.CLASS_THRESHOLD_SETTINGS.items()
-    }
-    conf = min(class_thresholds.values())
-    dets = detector.detect(
-        frame, conf, settings["imgsz"], class_thresholds,
-        default_conf=settings["conf_threshold"],
-    )
+    dets = detect_frame(detector, frame, settings)
     display_dets = manager.process_demo_detections(
-        src, frame, dets, on_detect,
-        lambda aid, evidence_frame, evidence_dets, captured_at, index:
-            on_evidence(aid, src, evidence_frame, evidence_dets, captured_at, index),
+        src,
+        frame,
+        dets,
+        on_detect,
+        lambda aid, evidence_frame, evidence_dets, captured_at, index: on_evidence(
+            aid, src, evidence_frame, evidence_dets, captured_at, index
+        ),
     )
     return jsonify(
         detections=display_dets,
@@ -290,7 +378,10 @@ def api_telemetry(sid):
     data = request.get_json(force=True)
     if not isinstance(data, dict):
         abort(400)
-    manager.telemetry[sid] = (time.time(), {k: v for k, v in data.items() if isinstance(v, (int, float, str))})
+    manager.telemetry[sid] = (
+        time.time(),
+        {k: v for k, v in data.items() if isinstance(v, (int, float, str))},
+    )
     return jsonify(ok=True)
 
 
@@ -308,16 +399,63 @@ def _resolve(aid, status):
 
 @app.post("/api/alerts/<int:aid>/dispatch")
 def api_dispatch(aid):
-    a = _resolve(aid, "dispatched")
-    ok, info = notifier.send_dispatch(a)
+    if not db.begin_dispatch(aid, operator()):
+        abort(409)
+    a = db.get_alert(aid)
+    settings = db.get_settings()
+    logged_only = not (settings["telegram_enabled"] and settings["telegram_token"])
+    try:
+        ok, info = notifier.send_dispatch(a)
+    except Exception:
+        ok, info = False, "Không thể gửi thông báo. Kiểm tra cấu hình và thử lại."
+        logged_only = False
+    db.finish_dispatch(aid, ok and not logged_only, info, ok and logged_only)
     db.log("DISPATCH", f"Dispatch alert #{aid}", f"{operator()} - {info}")
     return jsonify(ok=ok, info=info)
 
 
+@app.post("/api/alerts/<int:aid>/confirm")
+def api_confirm(aid):
+    return jsonify(_resolve(aid, "confirmed"))
+
+
+@app.post("/api/alerts/<int:aid>/complete")
+def api_complete(aid):
+    return jsonify(_resolve(aid, "completed"))
+
+
 @app.post("/api/alerts/<int:aid>/delete")
 def api_delete(aid):
-    _resolve(aid, "deleted")
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        abort(400)
+    reason = str(payload.get("reason", "")).strip()
+    if len(reason) > 500:
+        abort(400)
+    actual_label = str(payload.get("actual_label", "")).strip()
+    note = str(payload.get("note", "")).strip()
+    if actual_label not in ("", "background", *config.MODEL_CLASSES) or len(note) > 500:
+        abort(400)
+    if not db.review_false_alarm(aid, operator(), reason, actual_label, note):
+        abort(409)
     db.log("INFO", f"Delete alert #{aid}", f"{operator()} - báo động giả")
+    return jsonify(ok=True)
+
+
+@app.delete("/api/alerts/<int:aid>")
+def api_purge_alert(aid):
+    images = db.purge_alert(aid, operator())
+    if images is None:
+        abort(404)
+    if images is False:
+        return jsonify(error="Đang gửi thông báo, vui lòng thử lại sau"), 409
+    manager.forget_alert(aid)
+    for image in images:
+        if Path(image).name == image:
+            try:
+                (config.ALERT_DIR / image).unlink(missing_ok=True)
+            except OSError as error:
+                db.log("ERROR", f"Không thể dọn ảnh cảnh báo #{aid}", str(error)[:200])
     return jsonify(ok=True)
 
 
@@ -338,7 +476,10 @@ def api_note(aid):
 
 @app.get("/api/stats")
 def api_stats():
-    return jsonify(db.stats())
+    days = request.args.get("days", "7")
+    if days not in ("7", "30"):
+        abort(400, "Chỉ hỗ trợ 7 hoặc 30 ngày")
+    return jsonify(db.stats(int(days)))
 
 
 @app.get("/api/logs")
@@ -440,12 +581,12 @@ def api_mobile_device_test(device_id):
     return jsonify(ok=ok, info=info)
 
 
-def main():
+def _run_application():
     global detector
     if not config.MODEL_PATH.is_file():
         raise FileNotFoundError(
             f"YOLO weights not found: {config.MODEL_PATH}. "
-            "Copy ss_final_1.pt into the models folder."
+            "Copy ss_final_2.pt into the models folder."
         )
     config.ALERT_DIR.mkdir(parents=True, exist_ok=True)
     db.init()
@@ -455,3 +596,9 @@ def main():
         manager.start(s, detector, on_detect, on_evidence)
     db.log("INFO", "Hệ thống khởi động", f"{len(db.list_sources())} thiết bị")
     app.run(host=config.HOST, port=config.PORT, threaded=True, debug=False)
+
+
+def main():
+    # Acquire before loading the model or opening a capture device.
+    with single_instance(config.BASE_DIR / "data" / "safesight.lock"):
+        _run_application()
